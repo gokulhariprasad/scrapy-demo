@@ -1,0 +1,872 @@
+create
+    definer = reporting@`%` procedure sp_file_generator()
+BEGIN
+
+/*************************SQL DETAILS*******************************
+author: BRANDON RAY
+project name: FILE GEN 2.0
+change log:
+20240819 - BRAY - INITIAL ADD
+20241125 - BRAY - ADDED WC FLU CL SPRINGER BLD EXCLUSION
+********************************************************/
+-- added by kirey, used to filter down to just the most current previous month
+SET @bolast = DATE_ADD(LAST_DAY(DATE_ADD(NOW(), INTERVAL -2 MONTH)), INTERVAL +1 DAY);
+SET @eolast = LAST_DAY(@bolast);
+
+-- this is used for the "i" icon in each report
+drop temporary table if exists report_info_icon;
+create temporary table report_info_icon
+select 'The "File Generator" creates a production or other earnings adjustment file based on client specified requirements (Examples: Pooling, Leave of Absence, etc). The "Data as of" at the top of the report is the last time the report database was refreshed (refresh each night).'
+as report_info_icon
+;
+
+-- get domain_name from settings table
+drop temporary table if exists domain_name;
+
+DROP TEMPORARY TABLE IF EXISTS db_last_refresh;
+CREATE TEMPORARY TABLE db_last_refresh AS
+SELECT NOW() AS db_last_refresh;
+drop temporary table if exists final_display;
+
+/* build temp table for final display */
+create temporary table domain_name
+select max(value) as domain_name
+-- select *
+from settings as s
+where name='subdomain'
+;
+
+create temporary table final_display(
+     file_name varchar(255) -- name seen by the client on the front-end
+    ,file_type varchar(60) -- use only one of these three values: 'Production', 'Other Earnings', or 'Payroll'
+    ,file_description varchar(255) -- give a description of what the file's purpose and what it does/generates
+    ,`Service Dept` varchar(255) -- production
+    ,`Service Dept Gp` varchar(255) -- production
+    ,`Service Dept ID` varchar(60) -- production
+    ,`Rendering Provider` varchar(255) -- production
+    ,`Rendering Provider NPI` varchar(60) -- production
+    ,`Supervising Provider` varchar(255) -- production
+    ,`Supervising Provider NPI` varchar(60) -- production
+    ,`Procedure` varchar(60) -- production
+    ,`Procedure Description` varchar(255) -- production
+    ,`Service Date` date -- production
+    ,`Post Date` date -- production
+    ,`#Chg` decimal(10,2) -- production
+    ,`Work RVU` decimal(10,4) -- production
+    ,`Work RVU Adjustment Rate` decimal(10,2) -- production
+    ,`Chg` decimal(10,2) -- production
+    ,`Net Pmt` decimal(10,2) -- production
+    ,`Source ID` bigint -- production
+    ,`Notes` varchar(255) -- production / payroll / other earnings
+    ,`Check Date` date -- payroll / other earnings
+    ,`Start Date` date -- payroll
+    ,`End Date` date -- payroll
+    ,`Name` varchar(255) -- payroll / other earnings
+    ,`Provider Name` varchar(255) -- Ledger file
+    ,`Employee ID` varchar(60) -- payroll / other earnings
+    ,`Department` varchar(60) -- payroll / other earnings
+    ,`Department Number` varchar(60) -- Ledger file
+    ,`Position Department` varchar(60) -- payroll / other earnings
+    ,`Pay Code` varchar(60) -- payroll / other earnings
+    ,`Position Code` varchar(60) -- payroll / other earnings
+    ,`Description` varchar(255) -- payroll / other earnings
+    ,`Units` decimal(10,2) -- payroll / other earnings
+    ,`Rate Per Unit` decimal(10,2) -- other earnings
+    ,`Amount` decimal(10,2) -- payroll / other earnings
+    ,`Tag` varchar(60) -- other earnings
+    ,`Calculation` varchar(60) -- other earnings
+    ,`Manager` varchar(255) -- reporting
+    ,`Group` varchar(60) -- reporting
+    ,`NPI` varchar(60) -- reporting
+    ,`Provider NPI` varchar(60) -- Ledger File
+    ,`Months` int -- reporting
+    ,`RVUs` decimal(10,2) -- reporting
+    ,`RVU Rate` decimal(10,2) -- reporting
+    ,`Current Biweekly Draw` decimal(10,2) -- reporting
+    ,`Calced 90 Percent Biweekly Draw` decimal(10,2) -- reporting
+    ,`Adjustment Needed` tinyint -- reporting
+    ,`Location` varchar(255) -- reporting
+    ,`Specialty` varchar(255) -- reporting
+    ,`EOM Ctrct Dates` varchar(60) -- reporting
+    ,`EOM Sal Model` varchar(60) -- reporting
+    ,`EOM Rec Freq` varchar(60) -- reporting
+    ,`Accrual Stmt Date` date -- reporting
+    ,`Accrual Flag` tinyint -- reporting
+    ,`Accrual Amt` decimal(10,2) -- reporting
+    ,`Payout Ctrct Dates` varchar(60) -- reporting
+    ,`Payout Sal Model` varchar(60) -- reporting
+    ,`Payout Rec Freq` varchar(60) -- reporting
+    ,`Payout Stmt Date` date -- reporting
+    ,`Payout Flag` tinyint -- reporting
+    ,`Payout Amt` decimal(10,2) -- reporting
+    ,`Custom Flag` varchar(60) -- reporting
+    ,`Mid-Month` tinyint -- reporting
+    ,`Month` date -- reporting
+    ,`Contract Month` int -- reporting
+    ,`This Month RVUs` decimal(10,2) -- reporting
+    ,`CYTD RVUs` decimal(10,2) -- reporting
+    ,`CYTD Earnings` decimal(10,2) -- reporting
+    ,`CYTD Paid` decimal(10,2) -- reporting
+    ,`CYTD Balance` decimal(10,2) -- reporting
+    ,`Statement Date` date -- reporting
+    ,`Term Notes` text -- reporting
+    ,`Cost Center` varchar(60) -- reporting
+)
+;
+
+-- this is used as a temp holding table and will merge into "final_display" at the end (to address stupid "Cant reopen table" error)
+drop temporary table if exists final_display_norecords;
+create temporary table final_display_norecords(
+    file_name varchar(255) -- name seen by the client on the front-end
+    ,file_type varchar(60) -- use only one of these three values: 'Production', 'Other Earnings', or 'Payroll'
+    ,file_description varchar(255)
+)
+;
+
+-- time entry hardcode table for values
+drop temporary table if exists time_entry_values;
+create temporary table time_entry_values(
+    value int
+    ,description varchar(30)
+);
+
+insert into time_entry_values values
+(0,''),
+(1,'Provider Mobile (Hours)'),
+(2,'Upcoming Salary/Stipend'),
+(3,'Manual File'),
+(4,'Provider Mobile (Shifts)'),
+(5,'One-Time Payments')
+;
+
+/********************************************* SAINT FRANCIS ********************************************************/
+/********************************************************************************************************************/
+-- PRODUCTION ADJUSTMENT - SF Production Adjustment Master
+/********************************************************************************************************************/
+/****************************************************** SETUP *******************************************************/
+-- 1) GRAB CURRENT MONTH PRODUCTION AND CLEAN UP FIELDS
+drop temporary table if exists sf_current_month_production;
+create temporary table sf_current_month_production
+select prc.id as procedure_id
+    ,prc.name
+    ,prc.national_provider_identifier as npi
+    ,prc.date_applied
+    ,prc.supervisor_uid as sf_billing_provider
+    ,prc.service_dept as sf_department
+    ,prc.service_dept_uid as sf_place_of_service_type
+    ,prc.service_place as sf_bill_area
+    ,if(position('-' in prc.supervisor_name) = 0,prc.supervisor_name,left(prc.supervisor_name,position('-' in prc.supervisor_name) - 1)) as sf_transaction_id
+    ,if(position('-' in prc.supervisor_name) = 0,'',mid(prc.supervisor_name,position('-' in prc.supervisor_name) + 1,length(prc.supervisor_name)-position('-' in prc.supervisor_name))) as sf_plan
+    ,if(position(',' in prc.procedure_code) = 0,prc.procedure_code,left(prc.procedure_code,position(',' in prc.procedure_code) - 1)) as procedure_code_clean
+    ,if(position(',' in prc.procedure_code) = 0,'',mid(prc.procedure_code,position(',' in prc.procedure_code) + 1,length(prc.procedure_code)-position(',' in prc.procedure_code))) as modifiers
+    ,prc.procedure_description
+    ,prc.rvus
+    ,prc.charges_num
+    ,prc.source_id
+    ,prc.supervisor_name
+    ,prc.procedure_code
+    ,prc.date_service
+    ,JSON_UNQUOTE(JSON_EXTRACT(prc.extra_data, '$["peds id"]')) as pedsid
+from procedures prc
+where prc.date_applied between @bolast and @eolast
+    and ifnull(prc.source_id,0) = 0 -- only looking at original records
+    and prc.id not in (select x.source_id from procedures x where ifnull(x.source_id,0) > 0 and database() = 'rpt_saintfrancis') -- only looking at records not already adjusted
+    and prc.rvus <> 0
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 2) CREATE TRACKING TABLE FOR RVU ADJUSTMENTS
+drop temporary table if exists sf_production_adjustments_master_id_tracking;
+create temporary table sf_production_adjustments_master_id_tracking (category varchar(255),procedure_id bigint,adjustment_type varchar(10)
+    ,updated_npi varchar(10),updated_dept_uid varchar(255),updated_rvu_value decimal(10,4),notes varchar(255)
+    ,primary key(procedure_id,adjustment_type,updated_npi))
+;
+
+/*************************************************** RVU REMOVALS ***************************************************/
+-- 3) RETINAVUE REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'Retinavue' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'Retinavue RVU Adjustment' as notes
+from sf_current_month_production cmp
+where cmp.procedure_code_clean = '92250'
+    and cmp.npi <> '1235385766' -- Kelli Dyer
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 4) OUTREACH LAB REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'Outreach Lab' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'Outreach Lab RVU Adjustment' as notes
+from sf_current_month_production cmp
+where (cmp.sf_billing_provider = 'ST FRANCIS OUTREACH SERVICES [1020803]'
+        or cmp.sf_bill_area like '%OUTREACH LAB%')
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 5) EKG REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'EKG' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'EKG RVU Adjustment' as notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty_id between 4 and 7 -- Cardiology only
+where cmp.procedure_code_clean in ('93010','Q0960','Q0961','Q0692','Q0963','Q0964','Q0965','Q0966')
+    and cmp.sf_department not like 'WC%'
+    and cmp.sf_place_of_service_type <> 'Office'
+    and cmp.npi <> '1790708543' -- Lynn Preston gets to keep hers
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 6) MCA DEXA REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'MCA DEXA' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'MCA DEXA RVU Adjustment' as notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.location like '%mca%' -- McAlester only
+where cmp.procedure_code_clean in ('77080','77081','77082')
+    and cmp.modifiers not like '%26%'
+    and (cmp.sf_department like '%MCA%' or cmp.sf_bill_area like 'WCMCA%')
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 7) XAVIER REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'Xavier' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'Xavier RVU Adjustment' as notes
+from sf_current_month_production cmp
+where (cmp.sf_department like '%XMC%' or cmp.sf_bill_area like '%XMC%')
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 8) FLU CLINIC REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'Flu Clinic' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'Flu Clinic RVU Adjustment' as notes
+from sf_current_month_production cmp
+where (cmp.sf_department like '%FLU%' or cmp.sf_bill_area like '%FLU%')
+    and database() = 'rpt_saintfrancis'
+    AND cmp.sf_department <> 'WC FLU CL SPRINGER BLD [100401208]'
+;
+
+-- 9) MVISITS REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'MVISITS' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'MVISITS RVU Adjustment' as notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.level = 'Physician'
+    -- and prv.specialty not like '%cardio%' --kirey replaced due to northernlight not having this field yet
+    and prv.specialty_id in (select id from specialties where name not like '%cardio%')
+where cmp.procedure_code_clean = '99421'
+    and cmp.sf_plan = 'CC EMPLOYER CHOICE TORCH'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 10) SHARMA EUS REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'EUS' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'EUS RVU Adjustment' as notes
+from sf_current_month_production cmp
+where cmp.procedure_code_clean in ('43242','43238','43259')
+    and cmp.npi = '1336548445'
+    and database() = 'rpt_saintfrancis'
+;
+
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'PEDS Removal' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'PEDS RVU Adjustment' as notes
+from sf_current_month_production cmp
+where cmp.pedsid = 'P'
+and database() = 'rpt_saintfrancis';
+
+-- 11) ROEHL OB REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'ROEHL OB' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'OB RVU Adjustment' as notes
+from sf_current_month_production cmp
+where cmp.sf_bill_area = 'SAINT FRANCIS HOSPITALISTS OB [587]'
+    and cmp.sf_department = 'WC SF HOSP OB SVCS [100401525]'
+    and cmp.npi = '1720248164'
+    and database() = 'rpt_saintfrancis'
+;
+
+
+-- 12) UC EXTENDED HOURS RVU REMOVAL
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'UC Extended Hours' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'UC Extended Hours RVU Adjustment' as notes
+from sf_current_month_production cmp
+inner join rpt_saintfrancis.providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty_id in (15,16,17,32)
+where cmp.sf_department = 'WC URGENT CARE SPR [100401107]'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 12.1) G2211 REMOVAL FOR HEM/ONC PROVIDERS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'G2211' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'G2211 RVU Adjustment' as notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty = 'Hematology/Oncology' -- Hem/Onc only
+where cmp.procedure_code_clean = 'G2211'
+    and cmp.date_applied >= '2024-07-01' -- hardcoded this date on purpose - this is when the removal began - JMH
+    and database() = 'rpt_saintfrancis'
+;
+
+/*
+-- ADDED BY BRAY PER J MORGAN 2/1/25
+-- 12.1) 2025 Hematology/Oncology REMOVAL FOR HEM/ONC PROVIDERS
+insert ignore into sf_production_adjustments_master_id_tracking
+select '2025 Hematology/Oncology' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'2025 Hematology/Oncology RVU Adjustment' as notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty = 'Hematology/Oncology' -- Hem/Onc only
+where cmp.date_applied >= '2025-01-01' -- hardcoded this date on purpose - this is when the removal began - BR
+    and database() = 'rpt_saintfrancis'
+;
+*/
+/********************************** SERVICE_DEPT_UID UPDATES FOR VARYING RVU RATES **********************************/
+-- 13) TEMITAYO OYEKAN HOSPITALIST RVUS REMOVAL
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'Temitayo Oyekan Hospitalist RVUs' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'' as notes
+from sf_current_month_production cmp
+where cmp.npi = '1710966122'
+    and cmp.sf_bill_area in ('SOUTH HOSPITALISTS [542]','SAINT FRANCIS HOSPITALISTS [75]','MUSKOGEE MAIN HOSPITALISTS [346]')
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 14) TEMITAYO OYEKAN HOSPITALIST RVUS ADDITION WITH UPDATED SERVICE_DEPT_ID
+insert into sf_production_adjustments_master_id_tracking
+select 'Temitayo Oyekan Hospitalist RVUs' as category
+    ,cmp.procedure_id
+    ,'Addition' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,cmp.sf_bill_area as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'Hospitalist RVUs' as notes
+from sf_current_month_production cmp
+where cmp.npi = '1710966122'
+    and cmp.sf_bill_area in ('SOUTH HOSPITALISTS [542]','SAINT FRANCIS HOSPITALISTS [75]','MUSKOGEE MAIN HOSPITALISTS [346]')
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 15) JONATHAN LEVINE LTACH RVUS REMOVAL
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'Jonathan Levine LTACH RVUs' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'' as notes
+from sf_current_month_production cmp
+where cmp.npi = '1558360305'
+    and cmp.sf_department = 'WC SF WCSB HOSP SVCS [100401537]'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 16) JONATHAN LEVINE LTACH RVUS ADDITION WITH UPDATED SERVICE_DEPT_ID
+insert into sf_production_adjustments_master_id_tracking
+select 'Jonathan Levine LTACH RVUs' as category
+    ,cmp.procedure_id
+    ,'Addition' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,'WC SF WCSB HOSP SVCS [100401537]' as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'LTACH RVUs' as notes
+from sf_current_month_production cmp
+where cmp.npi = '1558360305'
+    and cmp.sf_department = 'WC SF WCSB HOSP SVCS [100401537]'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 17) SATISH BHADRIRAJIU HOSPITALIST RVUS REMOVAL
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'Satish Bhadriraju Hospitalist RVUs' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'' as notes
+from sf_current_month_production cmp
+where cmp.npi = '1518993997'
+    and (cmp.sf_bill_area = 'SAINT FRANCIS HOSPITALISTS [75]'
+        or (cmp.sf_department = 'WC SF HOSP SVCS [100401523]'
+            and cmp.sf_bill_area = 'WC SLEEP MEDICINE [27]'))
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 18) SATISH BHADRIRAJIU HOSPITALIST RVUS ADDITION WITH UPDATED SERVICE_DEPT_ID
+insert into sf_production_adjustments_master_id_tracking
+select 'Satish Bhadriraju Hospitalist RVUs' as category
+    ,cmp.procedure_id
+    ,'Addition' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,'WC SF HOSP SVCS [100401523]' as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'Hospitalist RVUs' as notes
+from sf_current_month_production cmp
+where cmp.npi = '1518993997'
+    and (cmp.sf_bill_area = 'SAINT FRANCIS HOSPITALISTS [75]'
+        or (cmp.sf_department = 'WC SF HOSP SVCS [100401523]'
+            and cmp.sf_bill_area = 'WC SLEEP MEDICINE [27]'))
+    and database() = 'rpt_saintfrancis'
+;
+
+/*
+-- 28.2) Hematology/Oncology 2025
+-- SHOULD Venkata,Vosuri BE INCLUDED?
+insert into sf_earnings_adjustmemts_master_id_tracking
+select '2025 Hematology/Oncology Addition' as category
+    ,cmp.procedure_id
+    ,'Addition' as adjustment_type
+    ,cmp.npi
+    ,cmp.sf_place_of_service_type as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'2025 Hematology/Oncology Credit' as notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty = 'Hematology/Oncology' -- Hem/Onc only
+where cmp.date_applied >= '2025-01-01' -- hardcoded this date on purpose - this is when the removal began - BR
+      and database() = 'rpt_saintfrancis'
+      and cmp.sf_place_of_service_type = 'Inpatient Hospital';
+*/
+
+/***************************************************** POOLING ******************************************************/
+-- 19) DANA DAVIS VACCINE POOLING RVUS REMOVAL
+insert into sf_production_adjustments_master_id_tracking
+select 'Dana Davis Vaccine Pooling RVUs' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'' as notes -- may reconsider adding a note here
+from sf_current_month_production cmp
+where cmp.npi = '1255330023'
+    and cmp.sf_department = 'WC VACCINE SVC SPR [100401331]'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 20) DANA DAVIS VACCINE POOLING RVUS REDISTRIBUTION
+insert into sf_production_adjustments_master_id_tracking
+select 'Dana Davis Vaccine Pooling RVUs' as category
+    ,cmp.procedure_id
+    ,'Addition' as adjustment_type
+    ,x.national_provider_identifier as updated_npi
+    ,null as updated_dept_uid
+    ,round(cmp.rvus/3,4) as updated_rvu_value -- if new providers are added, update rvu divisor
+    ,'Vaccine Clinic RVUs' as notes
+from sf_current_month_production cmp
+inner join (select national_provider_identifier from providers
+            where national_provider_identifier in ('1912170515','1255330023','1154320901')
+                and database() = 'rpt_saintfrancis') x -- if new providers are added, update rvu divisor
+    on 1 = 1
+where cmp.npi = '1255330023'
+    and cmp.sf_department = 'WC VACCINE SVC SPR [100401331]'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 21) NEPHROLOGY DIALYSIS POOLING RVUS REMOVAL
+insert into sf_production_adjustments_master_id_tracking
+select 'Nephrology Dialysis Pooling RVUs' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'Dialysis RVU Removal' as notes
+from sf_current_month_production cmp
+where cmp.npi in ('1417096629','1932300472','1376938167','1326201260','1427347947','1730506940')
+    and cmp.procedure_code_clean in ('90960','90961','90962','90966','g0420','g0421')
+    and cmp.date_applied < '2024-04-01'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 22) NEPHROLOGY DIALYSIS POOLING RVUS REDISTRIBUTION
+insert into sf_production_adjustments_master_id_tracking
+select 'Nephrology Dialysis Pooling RVUs' as category
+    ,cmp.procedure_id
+    ,'Addition' as adjustment_type
+    ,x.national_provider_identifier as updated_npi
+    ,null as updated_dept_uid
+    ,round(cmp.rvus/6,4) as updated_rvu_value -- if new providers are added, update rvu divisor
+    ,'Dialysis RVU Addition' as notes
+from sf_current_month_production cmp
+inner join (select national_provider_identifier from providers
+            where national_provider_identifier in ('1417096629','1932300472','1376938167','1326201260','1427347947','1730506940')
+                and database() = 'rpt_saintfrancis') x -- if new providers are added, update rvu divisor
+    on 1 = 1
+where cmp.npi in ('1417096629','1932300472','1376938167','1326201260','1427347947','1730506940')
+    and cmp.procedure_code_clean in ('90960','90961','90962','90966','g0420','g0421')
+    and cmp.date_applied < '2024-04-01'
+    and database() = 'rpt_saintfrancis'
+;
+
+/*************************************************** PRODUCTION MASTER OUTPUT ***************************************************/
+-- 23) FINAL PRODUCTION MASTER OUTPUT
+insert into final_display (file_name,file_type,file_description,`Service Dept`,`Service Dept Gp`,`Service Dept ID`,`Rendering Provider`
+    ,`Rendering Provider NPI`,`Supervising Provider`,`Supervising Provider NPI`,`Procedure`,`Procedure Description`,`Service Date`
+    ,`Post Date`,`#Chg`,`Work RVU`,`Work RVU Adjustment Rate`,`Chg`,`Net Pmt`,`Notes`,`Source ID`)
+select 'SF Production Adjustment Master' as file_name
+    ,'Production' as file_type
+    ,'Generates the Production Adjustment Master File' as file_description
+    ,cmp.sf_department as `Service Dept`
+    ,cmp.sf_bill_area as `Service Dept Gp`
+    ,ifnull(idt.updated_dept_uid,cmp.sf_place_of_service_type) as `Service Dept ID`
+    ,ifnull(concat(prv.last_name,', ',prv.first_name),cmp.name) as `Rendering Provider`
+    ,ifnull(idt.updated_npi,cmp.npi) as `Rendering Provider NPI`
+    ,cmp.supervisor_name as `Supervising Provider`
+    ,cmp.sf_billing_provider as `Supervising Provider NPI`
+    ,cmp.procedure_code as `Procedure`
+    ,cmp.procedure_description as `Procedure Description`
+    ,cmp.date_service as `Service Date`
+    ,cmp.date_applied as `Post Date`
+    ,0 as `#Chg`
+    ,ifnull(idt.updated_rvu_value,cmp.rvus) * if(idt.adjustment_type = 'Removal',-1,1) as `Work RVU`
+    ,0 as `Work RVU Adjustment Rate`
+    ,0 as `Chg`
+    ,0 as `Net Pmt`
+    ,idt.notes as `Notes`
+    ,idt.procedure_id as `Source ID`
+from sf_current_month_production cmp
+inner join sf_production_adjustments_master_id_tracking idt
+    on idt.procedure_id = cmp.procedure_id
+left join providers prv
+    on prv.national_provider_identifier = idt.updated_npi
+where database() = 'rpt_saintfrancis'
+;
+
+-- 24) INSERT BLANK RECORD IF NO RECORDS EXIST IN TABLE (SO THAT REPORT SHOWS ALL FILE NAMES)
+insert into final_display_norecords (file_name,file_type,file_description)
+select 'SF Production Adjustment Master' as file_name
+    ,'Production' as file_type
+    ,'Generates the Production Adjustment Master File' as file_description
+where database() = 'rpt_saintfrancis'
+and 0=(select count(*) from final_display as x where x.file_name='SF Production Adjustment Master')
+;
+
+/*********************************************/
+-- OE ADJUSTMENT - SF EARNINGS Adjustment Master
+/*********************************************/
+/************************************* EARNINGS ADDITIONS BASED ON RVU REMOVALS *************************************/
+-- USES TEMP TABLE "sf_current_month_production" FROM THE ABOVE CODE FOR "SF Production Adjustment Master"
+
+-- 25) CREATE TRACKING TABLE FOR EARNINGS ADJUSTMENTS (CAN'T BE A TEMP TABLE DUE TO MYSQL RESTRICTIONS ON RE-OPENING A TEMP TABLE)
+drop temporary table if exists sf_earnings_adjustmemts_master_id_tracking;
+create temporary table sf_earnings_adjustmemts_master_id_tracking (category varchar(255),procedure_id bigint,npi varchar(60),adjustment_type varchar(10)
+    ,units decimal(10,2),rate_per_unit decimal(10,2),desc_and_notes varchar(255))
+;
+
+-- 26) MVISITS ADDITIONS
+insert into sf_earnings_adjustmemts_master_id_tracking
+select 'MVISITS Earnings Addition' as category
+    ,cmp.procedure_id
+    ,cmp.npi
+    ,'Addition' as adjustment_type
+    ,round((cmp.rvus/abs(cmp.rvus))*cmp.charges_num,2) as units
+    ,25 as rate_per_unit
+    ,'MVISITS' as desc_and_notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.level = 'Physician'
+    -- and prv.specialty not like '%cardio%' --kirey replaced due to northernlight not having this field yet
+    and prv.specialty_id in (select id from specialties where name not like '%cardio%')
+where cmp.procedure_code_clean = '99421'
+    and cmp.sf_plan = 'CC EMPLOYER CHOICE TORCH'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 27) DEXA READS ADDITIONS
+insert into sf_earnings_adjustmemts_master_id_tracking
+select 'DEXA Reads Earnings Addition' as category
+    ,cmp.procedure_id
+    ,cmp.npi
+    ,'Addition' as adjustment_type
+    ,round((cmp.rvus/abs(cmp.rvus))*cmp.charges_num,2) as units
+    ,10 as rate_per_unit
+    ,'DEXA Reads' as desc_and_notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.location like '%mca%' -- McAlester only
+where cmp.procedure_code_clean in ('77080','77081','77082')
+    and (cmp.sf_department like '%MCA%' or cmp.sf_bill_area like 'WCMCA%')
+    and cmp.modifiers not like '%26%'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 28) SHARMA EUS ADDITIONS
+insert into sf_earnings_adjustmemts_master_id_tracking
+select 'Sharma EUS Earnings Addition' as category
+    ,cmp.procedure_id
+    ,cmp.npi
+    ,'Addition' as adjustment_type
+    ,round((cmp.rvus/abs(cmp.rvus))*cmp.charges_num * 1.5,2) as units
+    ,265 as rate_per_unit
+    ,'EUS' as desc_and_notes
+from sf_current_month_production cmp
+where cmp.procedure_code_clean in ('43242','43238','43259')
+    and cmp.npi = '1336548445'
+    and database() = 'rpt_saintfrancis'
+;
+
+-- 28.1) G2211 ADDITIONS
+insert into sf_earnings_adjustmemts_master_id_tracking
+select 'G2211 Addition' as category
+    ,cmp.procedure_id
+    ,cmp.npi
+    ,'Addition' as adjustment_type
+    ,round((cmp.rvus/abs(cmp.rvus))*cmp.charges_num,2) as units
+    ,15.42 as rate_per_unit
+    ,'G2211 Credit' as desc_and_notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty = 'Hematology/Oncology' -- Hem/Onc only
+where cmp.procedure_code_clean = 'G2211'
+    and cmp.date_applied >= '2024-07-01' AND cmp.date_applied < '2025-01-01' -- hardcoded this date on purpose - this is when the addition began - JMH
+    and database() = 'rpt_saintfrancis'
+;
+
+-- ADDED BY BRAY 2/01 PER JULIE MORGAN
+insert into sf_earnings_adjustmemts_master_id_tracking
+select 'G2211 Addition' as category
+    ,cmp.procedure_id
+    ,cmp.npi
+    ,'Addition' as adjustment_type
+    ,round((cmp.rvus/abs(cmp.rvus))*cmp.charges_num,2) as units
+    ,14.95 as rate_per_unit
+    ,'G2211 Credit' as desc_and_notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty = 'Hematology/Oncology' -- Hem/Onc only
+where cmp.procedure_code_clean = 'G2211'
+    and cmp.date_applied >= '2025-01-01'-- hardcoded this date on purpose - this is when the addition began - JMH
+    and database() = 'rpt_saintfrancis'
+;
+
+/*************************************************** EARNINGS MASTER OUTPUT ***************************************************/
+-- 29) FINAL EARNINGS MASTER OUTPUT
+insert into final_display (file_name,file_type,file_description,`Check Date`,`Employee ID`,`Pay Code`,`Amount`
+    ,`End Date`,`Calculation`,`Description`,`Name`,`Department`,`Start Date`,`Position Code`,`Units`,`Rate Per Unit`
+    ,`Notes`,`Tag`)
+select 'SF Earnings Adjustment Master' as file_name
+    ,'Other Earnings' as file_type
+    ,'Generates the Earnings Adjustment Master File' as file_description
+    ,@eolast as `Check Date`
+    ,prv.employee_uid as `Employee ID`
+    ,'' as `Pay Code`
+    ,round(sum(idt.units) * idt.rate_per_unit,2) as `Amount`
+    ,@eolast as `End Date`
+    ,'Annualize' as `Calculation`
+    ,idt.desc_and_notes as `Description`
+    ,concat(prv.last_name,', ',prv.first_name) as `Name`
+    ,'' as `Department`
+    ,'0000-00-00' as `Start Date`
+    ,'' as `Position Code`
+    ,sum(idt.units) as `Units`
+    ,idt.rate_per_unit as `Rate Per Unit`
+    ,idt.desc_and_notes as `Notes`
+    ,'' as `Tag`
+from sf_earnings_adjustmemts_master_id_tracking idt
+left join providers prv
+    on prv.national_provider_identifier = idt.npi
+where database() = 'rpt_saintfrancis'
+group by @eolast
+    ,prv.employee_uid
+    ,idt.desc_and_notes
+    ,concat(prv.last_name,', ',prv.first_name)
+    ,idt.rate_per_unit
+;
+
+-- 30) INSERT BLANK RECORD IF NO RECORDS EXIST IN TABLE (SO THAT REPORT SHOWS ALL FILE NAMES)
+insert into final_display_norecords (file_name,file_type,file_description)
+select 'SF Earnings Adjustment Master' as file_name
+    ,'Other Earnings' as file_type
+    ,'Generates the Earnings Adjustment Master File' as file_description
+where database() = 'rpt_saintfrancis'
+and 0=(select count(*) from final_display as x where x.file_name='SF Earnings Adjustment Master' )
+;
+
+/**********************************************************************************************/
+-- REPORTING 27 - Saint Francis Custom Accrual Report
+/**********************************************************************************************/
+insert into final_display (file_name,file_type,file_description,`Statement Date`,`Name`,`Employee ID`,`NPI`,`Cost Center`
+    ,Location,`Group`,Specialty,`Contract Month`,`This Month RVUs`,`CYTD RVUs`,`CYTD Earnings`,`CYTD Paid`,`CYTD Balance`,`Term Notes`)
+select 'Rpt - Saint Francis Custom Accrual Report' as file_name
+    ,'Reporting 27' as file_type
+    ,'Rpt - Saint Francis Custom Accrual Report' as file_description
+    ,s1.statement_date as `Statement Date`
+    ,concat(prv.last_name,', ',prv.first_name) as `Name`
+    ,prv.employee_uid as `Employee ID`
+    ,prv.national_provider_identifier as `NPI`
+    ,prv.department as `Cost Center`
+    ,prv.location as `Location`
+    ,prv.group as `Group`
+    ,ifnull(spc.name,'') as `Specialty`
+    ,s1.month as `Contract Month`
+    ,(s1.current_rvus - ifnull(s2.current_rvus,0)) as `This Month RVUs`
+    ,s1.current_rvus as `CYTD RVUs` -- this is misnamed in the database table and isn't consistent with how the other fields are named
+    ,s1.production_tiers + s1.additional_earnings as `CYTD Earnings`
+    ,s1.draw  as `CYTD Paid`
+    ,s1.owed as `CYTD Balance`
+    ,regexp_replace(prd.term_notes, '[^\\x20-\\x7E]', ' ') as term_notes
+from statements s1
+inner join providers prv
+    on prv.id = s1.provider_id
+inner join periods prd
+    on prd.id = s1.period_id
+left join statements s2
+    on s2.provider_id = s1.provider_id
+    and s2.statement_date = date_sub(@bolast, interval 1 day)
+left join procedures prc
+    on prc.national_provider_identifier = prv.national_provider_identifier
+    and prc.date_applied between @bolast and @eolast
+left join specialties spc
+    on spc.id = prv.specialty_id
+where s1.statement_date = @eolast
+    and database() = 'rpt_saintfrancis'
+group by s1.statement_date
+    ,concat(prv.last_name,', ',prv.first_name)
+    ,prv.employee_uid
+    ,prv.national_provider_identifier
+    ,prv.department
+    ,prv.location
+    ,prv.group
+    ,ifnull(spc.name,'')
+    ,s1.month
+    ,(s1.current_rvus - ifnull(s2.current_rvus,0))
+    ,s1.current_rvus
+    ,s1.production_tiers + s1.additional_earnings
+    ,s1.draw
+    ,s1.owed
+    ,regexp_replace(prd.term_notes, '[^\\x20-\\x7E]', ' ')
+order by name
+;
+
+-- INSERT BLANK RECORD IF NO RECORDS EXIST IN TABLE (SO THAT REPORT SHOWS ALL FILE NAMES)
+insert into final_display_norecords (file_name,file_type,file_description)
+select 'Rpt - Saint Francis Custom Accrual Report' as file_name
+    ,'Reporting 27' as file_type
+    ,'Rpt - Saint Francis Custom Accrual Report' as file_description
+where database() = 'rpt_saintfrancis'
+and 0=(select count(*) from final_display as x where x.file_name like 'Rpt - Saint Francis Custom Accrual Report')
+;
+
+insert into final_display (file_name,file_type,file_description)
+select file_name
+     ,file_type
+     ,file_description
+from final_display_norecords
+;
+
+DELETE
+FROM rpt_file_generator AS rfg
+WHERE EXISTS (SELECT 1
+              FROM final_display AS fd
+              WHERE fd.file_name = rfg.file_name);
+
+INSERT INTO rpt_file_generator (db_last_refresh,report_info_icon,domain_name,row_num,file_name,file_type,file_description,`Service Dept`,`Service Dept Gp`,`Service Dept ID`,`Rendering Provider`,`Rendering Provider NPI`,`Supervising Provider`,`Supervising Provider NPI`,`Procedure`,`Procedure Description`
+    ,`Service Date`,`Post Date`,`#Chg`,`Work RVU`,`Work RVU Adjustment Rate`,`Chg`,`Net Pmt`,`Source ID`,`Notes`,`Check Date`,`Start Date`,`End Date`,`Name`,`Provider Name`,`Employee ID`,`Department`,`Department Number`,`Position Department`,`Pay Code`
+    ,`Position Code`,`Description`,`Units`,`Rate Per Unit`,`Amount`,`Tag`,`Calculation`,`Manager`,`Group`,`NPI`,`Provider NPI`,`Months`,`RVUs`,`RVU Rate`,`Current Biweekly Draw`,`Calced 90 Percent Biweekly Draw`,`Adjustment Needed`,`Location`,`Specialty`
+    ,`EOM Ctrct Dates`,`EOM Sal Model`,`EOM Rec Freq`,`Accrual Stmt Date`,`Accrual Flag`,`Accrual Amt`,`Payout Ctrct Dates`,`Payout Sal Model`,`Payout Rec Freq`,`Payout Stmt Date`,`Payout Flag`,`Payout Amt`,`Custom Flag`,`Mid-Month`,`Month`,`Contract Month`,`This Month RVUs`
+    ,`CYTD RVUs`,`CYTD Earnings`,`CYTD Paid`,`CYTD Balance`,`Statement Date`,`Term Notes`,`Cost Center`)
+SELECT
+     dlr.db_last_refresh
+    ,rii.report_info_icon
+    ,dn.domain_name -- example: dev
+    ,ROW_NUMBER() OVER (ORDER BY `Rendering Provider NPI`) AS row_num -- this is used in tableau to keep tableau from removing "duplicates"
+    ,a.*
+FROM final_display AS a
+    JOIN db_last_refresh AS dlr ON 1=1
+    JOIN report_info_icon AS rii ON 1=1
+    LEFT JOIN domain_name AS dn ON 1=1;
+-- select * from rpt_file_generator;
+
+END;
+
