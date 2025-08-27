@@ -166,7 +166,7 @@ select prc.id as procedure_id
     ,prc.supervisor_name
     ,prc.procedure_code
     ,prc.date_service
-    ,JSON_UNQUOTE(JSON_EXTRACT(prc.extra_data, '$["peds id"]')) as pedsid
+    ,JSON_UNQUOTE(JSON_EXTRACT(prc.extra_data, '$."peds id"')) as pedsid
 from procedures prc
 where prc.date_applied between @bolast and @eolast
     and ifnull(prc.source_id,0) = 0 -- only looking at original records
@@ -316,18 +316,6 @@ where cmp.procedure_code_clean in ('43242','43238','43259')
     and database() = 'rpt_saintfrancis'
 ;
 
-insert ignore into sf_production_adjustments_master_id_tracking
-select 'PEDS Removal' as category
-    ,cmp.procedure_id
-    ,'Removal' as adjustment_type
-    ,cmp.npi as updated_npi
-    ,null as updated_dept_uid
-    ,null as updated_rvu_value
-    ,'PEDS RVU Adjustment' as notes
-from sf_current_month_production cmp
-where cmp.pedsid = 'P'
-and database() = 'rpt_saintfrancis';
-
 -- 11) ROEHL OB REMOVALS
 insert ignore into sf_production_adjustments_master_id_tracking
 select 'ROEHL OB' as category
@@ -379,6 +367,21 @@ where cmp.procedure_code_clean = 'G2211'
     and cmp.date_applied >= '2024-07-01' -- hardcoded this date on purpose - this is when the removal began - JMH
     and database() = 'rpt_saintfrancis'
 ;
+
+-- 12) PEDS REMOVAL
+
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'PEDS Removal' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'PEDS RVU Adjustment' as notes
+from sf_current_month_production cmp
+where pedsid = 'P'
+  and cmp.npi = '1780033548'
+  and database() = 'rpt_saintfrancis';
 
 /*
 -- ADDED BY BRAY PER J MORGAN 2/1/25
