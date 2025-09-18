@@ -1,0 +1,18 @@
+## Comment - Meant to replace lines 219 to 237 in MySQL (SimpliData)/SimpliData_custom/routines/sp_file_generator_saintfrancis.sql
+
+-- 5) EKG REMOVALS
+insert ignore into sf_production_adjustments_master_id_tracking
+select 'EKG' as category
+    ,cmp.procedure_id
+    ,'Removal' as adjustment_type
+    ,cmp.npi as updated_npi
+    ,null as updated_dept_uid
+    ,null as updated_rvu_value
+    ,'EKG RVU Adjustment' as notes
+from sf_current_month_production cmp
+inner join providers prv
+    on prv.national_provider_identifier = cmp.npi
+    and prv.specialty_id between 4 and 7 -- Cardiology only
+where cmp.procedure_code_clean = '93010'
+and database() = 'rpt_saintfrancis'
+;
